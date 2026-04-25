@@ -8,6 +8,9 @@ from flask import Flask, request, jsonify, send_file, render_template
 
 app = Flask(__name__)
 DOWNLOAD_DIR = os.path.join(os.path.dirname(__file__), "downloads")
+COOKIES_DIR = os.path.join(os.path.dirname(__file__), "cookies.txt")
+COOKIES_CMD = ["--cookies-from-browser", "chromium"] if not os.path.exists(COOKIES_DIR) else ["--cookies", COOKIES_DIR]
+
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 jobs = {}
@@ -16,13 +19,13 @@ jobs = {}
 def run_download(job_id, url, format_choice, format_id):
     job = jobs[job_id]
     out_template = os.path.join(DOWNLOAD_DIR, f"{job_id}.%(ext)s")
-
-    cmd = ["yt-dlp", "--no-playlist", "-o", out_template]
-
+    cmd = ["yt-dlp", "--no-playlist", *COOKIES_CMD, "-o", out_template]
+ 
+  
     if format_choice == "audio":
         cmd += ["-x", "--audio-format", "mp3"]
     elif format_id:
-        cmd += ["-f", f"{format_id}+bestaudio/best", "--merge-output-format", "mp4"]
+        cmd += ["-f", f"{format_id}+bestaudio/{format_id}/bestvideo+bestaudio/best", "--merge-output-format", "mp4"]
     else:
         cmd += ["-f", "bestvideo+bestaudio/best", "--merge-output-format", "mp4"]
 
@@ -59,7 +62,6 @@ def run_download(job_id, url, format_choice, format_id):
         job["file"] = chosen
         ext = os.path.splitext(chosen)[1]
         title = job.get("title", "").strip()
-        # Sanitize title for filename
         if title:
             safe_title = "".join(c for c in title if c not in r'\/:*?"<>|').strip()[:20].strip()
             job["filename"] = f"{safe_title}{ext}" if safe_title else os.path.basename(chosen)
@@ -85,7 +87,8 @@ def get_info():
     if not url:
         return jsonify({"error": "No URL provided"}), 400
 
-    cmd = ["yt-dlp", "--no-playlist", "-j", url]
+    cmd = ["yt-dlp", "--no-playlist", *COOKIES_CMD, "-j", url]
+
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
         if result.returncode != 0:
@@ -93,14 +96,18 @@ def get_info():
 
         info = json.loads(result.stdout)
 
-        # Build quality options — keep best format per resolution
         best_by_height = {}
         for f in info.get("formats", []):
             height = f.get("height")
-            if height and f.get("vcodec", "none") != "none":
-                tbr = f.get("tbr") or 0
-                if height not in best_by_height or tbr > (best_by_height[height].get("tbr") or 0):
-                    best_by_height[height] = f
+            vcodec = f.get("vcodec", "none")
+            proto = f.get("protocol", "")
+            if not height or vcodec == "none":
+                continue
+            if proto not in ("https", "http"):
+                continue
+            tbr = f.get("tbr") or 0
+            if height not in best_by_height or tbr > (best_by_height[height].get("tbr") or 0):
+                best_by_height[height] = f
 
         formats = []
         for height, f in best_by_height.items():
