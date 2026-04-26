@@ -266,7 +266,9 @@
       font-size: 0.68rem;
       color: var(--muted);
     }
+    .card-status.queued { color: var(--muted); }
     .card-status.downloading { color: var(--accent); }
+    .card-status.uploading { color: var(--accent-hover); }
     .card-status.done { color: var(--success); }
     .card-status.error { color: var(--error); }
 
@@ -567,8 +569,12 @@
       let actionHtml = '';
       if (c.status === 'ready') {
         actionHtml = `<button class="card-dl-btn" onclick="dlCard(${idx})">Download</button>${qualityChips}`;
+      } else if (c.status === 'queued') {
+        actionHtml = `<span class="card-status queued"><span class="spin"></span> Queued...</span>`;
       } else if (c.status === 'downloading') {
         actionHtml = `<span class="card-status downloading"><span class="spin"></span> Downloading...</span>`;
+      } else if (c.status === 'uploading') {
+        actionHtml = `<span class="card-status uploading"><span class="spin"></span> Uploading...</span>`;
       } else if (c.status === 'done') {
         actionHtml = `<button class="card-dl-btn done" onclick="saveCard(${idx})">Save</button>
           <span class="card-status done">${esc(c.filename || '')}</span>`;
@@ -605,7 +611,7 @@
 
     async function dlCard(idx) {
       const c = cardData[idx];
-      c.status = 'downloading';
+      c.status = 'queued';
       c.error = null;
       renderCard(idx);
 
@@ -628,6 +634,8 @@
           return;
         }
         c.jobId = data.job_id;
+        c.status = data.status || 'queued';
+        renderCard(idx);
         pollCard(idx);
       } catch (err) {
         c.status = 'error';
@@ -652,6 +660,9 @@
             clearInterval(iv);
             c.status = 'error';
             c.error = data.error;
+            renderCard(idx);
+          } else {
+            c.status = data.status || c.status;
             renderCard(idx);
           }
         } catch {

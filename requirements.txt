@@ -1,3 +1,4 @@
 flask
 yt-dlp[default]
 boto3
+gunicorn

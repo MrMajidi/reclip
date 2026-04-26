@@ -1,32 +1,128 @@
-import os
-import json
 import glob
-import uuid
+import json
+import mimetypes
+import os
+import queue
 import subprocess
-import threading
 import tempfile
+import threading
 import time
+import uuid
+
 import boto3
-from flask import Flask, request, jsonify, redirect, render_template
+from boto3.s3.transfer import TransferConfig
+from flask import Flask, jsonify, redirect, render_template, request
 
 app = Flask(__name__)
 
 S3_BUCKET_NAME = os.environ.get("S3_BUCKET_NAME")
 AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
 R2_ENDPOINT_URL = os.environ.get("R2_ENDPOINT_URL")
-R2_CUSTOM_DOMAIN = os.environ.get("R2_CUSTOM_DOMAIN")
+R2_CUSTOM_DOMAIN = os.environ.get("R2_CUSTOM_DOMAIN", "").rstrip("/")
+
+CLEANUP_INTERVAL = int(os.environ.get("CLEANUP_INTERVAL", "600"))
+FILE_RETENTION_TIME = int(os.environ.get("FILE_RETENTION_TIME", "3600"))
+INFO_CACHE_TTL = int(os.environ.get("INFO_CACHE_TTL", "120"))
+DOWNLOAD_TIMEOUT = int(os.environ.get("DOWNLOAD_TIMEOUT", "300"))
+INFO_TIMEOUT = int(os.environ.get("INFO_TIMEOUT", "60"))
+DOWNLOAD_WORKERS = max(1, int(os.environ.get("DOWNLOAD_WORKERS", "4")))
+MAX_DOWNLOAD_QUEUE_SIZE = max(1, int(os.environ.get("MAX_DOWNLOAD_QUEUE_SIZE", "32")))
+MAX_CONCURRENT_INFO_REQUESTS = max(1, int(os.environ.get("MAX_CONCURRENT_INFO_REQUESTS", "8")))
+S3_MULTIPART_CHUNK_SIZE_MB = max(5, int(os.environ.get("S3_MULTIPART_CHUNK_SIZE_MB", "8")))
+
 s3_client = boto3.client(
     "s3",
     region_name=AWS_REGION,
-    endpoint_url=R2_ENDPOINT_URL
+    endpoint_url=R2_ENDPOINT_URL,
+)
+s3_transfer_config = TransferConfig(
+    multipart_threshold=S3_MULTIPART_CHUNK_SIZE_MB * 1024 * 1024,
+    multipart_chunksize=S3_MULTIPART_CHUNK_SIZE_MB * 1024 * 1024,
+    use_threads=False,
 )
 
-COOKIES_DIR = os.path.join(os.path.dirname(__file__), "cookies.txt")
-COOKIES_CMD = ["--cookies-from-browser", "chromium"] if not os.path.exists(COOKIES_DIR) else ["--cookies", COOKIES_DIR]
+COOKIES_FILE = os.path.join(os.path.dirname(__file__), "cookies.txt")
+COOKIES_CMD = ["--cookies", COOKIES_FILE] if os.path.exists(COOKIES_FILE) else ["--cookies-from-browser", "chromium"]
 
 jobs = {}
-CLEANUP_INTERVAL = 600  # 10 minutes
-FILE_RETENTION_TIME = 3600  # 1 hour
+jobs_lock = threading.Lock()
+download_queue = queue.Queue(maxsize=MAX_DOWNLOAD_QUEUE_SIZE)
+info_cache = {}
+info_cache_lock = threading.Lock()
+info_semaphore = threading.BoundedSemaphore(MAX_CONCURRENT_INFO_REQUESTS)
+
+
+def get_json_payload():
+    return request.get_json(silent=True) or {}
+
+
+def create_job(job_id, **fields):
+    with jobs_lock:
+        jobs[job_id] = fields.copy()
+
+
+def update_job(job_id, **fields):
+    with jobs_lock:
+        job = jobs.get(job_id)
+        if job is not None:
+            job.update(fields)
+
+
+def get_job(job_id):
+    with jobs_lock:
+        job = jobs.get(job_id)
+        return job.copy() if job else None
+
+
+def delete_job(job_id):
+    with jobs_lock:
+        jobs.pop(job_id, None)
+
+
+def extract_error(stderr):
+    for line in reversed(stderr.splitlines()):
+        stripped = line.strip()
+        if stripped:
+            return stripped
+    return "Request failed"
+
+
+def sanitize_filename(title, fallback_name):
+    title = (title or "").strip()
+    if not title:
+        return fallback_name
+
+    safe_title = "".join(c for c in title if c not in r'\/:*?"<>|').strip()[:80].strip()
+    return f"{safe_title}{os.path.splitext(fallback_name)[1]}" if safe_title else fallback_name
+
+
+def build_s3_url(s3_key):
+    if R2_CUSTOM_DOMAIN:
+        return f"{R2_CUSTOM_DOMAIN}/{s3_key}"
+    return s3_client.generate_presigned_url(
+        "get_object",
+        Params={"Bucket": S3_BUCKET_NAME, "Key": s3_key},
+        ExpiresIn=FILE_RETENTION_TIME,
+    )
+
+
+def cache_info(url, payload):
+    with info_cache_lock:
+        info_cache[url] = {
+            "expires_at": time.time() + INFO_CACHE_TTL,
+            "payload": payload,
+        }
+
+
+def get_cached_info(url):
+    with info_cache_lock:
+        cached = info_cache.get(url)
+        if not cached:
+            return None
+        if cached["expires_at"] <= time.time():
+            info_cache.pop(url, None)
+            return None
+        return cached["payload"]
 
 
 def cleanup_old_files():
@@ -34,34 +130,69 @@ def cleanup_old_files():
         try:
             time.sleep(CLEANUP_INTERVAL)
             current_time = time.time()
-            to_delete = []
 
-            for job_id, job in list(jobs.items()):
-                if job["status"] == "done" and "upload_time" in job:
-                    if current_time - job["upload_time"] > FILE_RETENTION_TIME:
-                        s3_key = f"downloads/{job_id}/{job['filename']}"
-                        try:
-                            s3_client.delete_object(Bucket=S3_BUCKET_NAME, Key=s3_key)
-                            to_delete.append(job_id)
-                        except Exception as e:
-                            print(f"Error deleting {s3_key}: {e}")
+            with info_cache_lock:
+                expired_urls = [url for url, cached in info_cache.items() if cached["expires_at"] <= current_time]
+                for url in expired_urls:
+                    info_cache.pop(url, None)
 
-            for job_id in to_delete:
-                del jobs[job_id]
-        except Exception as e:
-            print(f"Cleanup job error: {e}")
+            with jobs_lock:
+                job_items = list(jobs.items())
+
+            for job_id, job in job_items:
+                finished_at = job.get("finished_at")
+                if not finished_at or current_time - finished_at <= FILE_RETENTION_TIME:
+                    continue
+
+                if job.get("status") == "done" and job.get("s3_key"):
+                    try:
+                        s3_client.delete_object(Bucket=S3_BUCKET_NAME, Key=job["s3_key"])
+                    except Exception as exc:
+                        print(f"Error deleting {job['s3_key']}: {exc}")
+                        continue
+
+                delete_job(job_id)
+        except Exception as exc:
+            print(f"Cleanup job error: {exc}")
 
 
-cleanup_thread = threading.Thread(target=cleanup_old_files, daemon=True)
-cleanup_thread.start()
+def find_downloaded_file(temp_dir, job_id, format_choice):
+    files = glob.glob(os.path.join(temp_dir, f"{job_id}.*"))
+    if not files:
+        raise FileNotFoundError("Download completed but no file was found")
+
+    preferred_ext = ".mp3" if format_choice == "audio" else ".mp4"
+    target = [path for path in files if path.endswith(preferred_ext)]
+    return target[0] if target else files[0]
+
+
+def upload_file_to_s3(local_path, s3_key):
+    extra_args = {}
+    content_type = mimetypes.guess_type(local_path)[0]
+    if content_type:
+        extra_args["ContentType"] = content_type
+
+    upload_kwargs = {"Config": s3_transfer_config}
+    if extra_args:
+        upload_kwargs["ExtraArgs"] = extra_args
+
+    s3_client.upload_file(local_path, S3_BUCKET_NAME, s3_key, **upload_kwargs)
 
 
 def run_download(job_id, url, format_choice, format_id):
-    job = jobs[job_id]
+    update_job(job_id, status="downloading", error=None)
 
     with tempfile.TemporaryDirectory() as temp_dir:
         out_template = os.path.join(temp_dir, f"{job_id}.%(ext)s")
-        cmd = ["yt-dlp", "--no-playlist", *COOKIES_CMD, "-o", out_template]
+        cmd = [
+            "yt-dlp",
+            "--no-playlist",
+            "--no-progress",
+            "--no-warnings",
+            *COOKIES_CMD,
+            "-o",
+            out_template,
+        ]
 
         if format_choice == "audio":
             cmd += ["-x", "--audio-format", "mp3"]
@@ -73,53 +204,73 @@ def run_download(job_id, url, format_choice, format_id):
         cmd.append(url)
 
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            result = subprocess.run(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=DOWNLOAD_TIMEOUT,
+            )
             if result.returncode != 0:
-                job["status"] = "error"
-                job["error"] = result.stderr.strip().split("\n")[-1]
-                return
-
-            files = glob.glob(os.path.join(temp_dir, f"{job_id}.*"))
-            if not files:
-                job["status"] = "error"
-                job["error"] = "Download completed but no file was found"
-                return
-
-            if format_choice == "audio":
-                target = [f for f in files if f.endswith(".mp3")]
-                chosen = target[0] if target else files[0]
-            else:
-                target = [f for f in files if f.endswith(".mp4")]
-                chosen = target[0] if target else files[0]
-
-            ext = os.path.splitext(chosen)[1]
-            title = job.get("title", "").strip()
-            if title:
-                safe_title = "".join(c for c in title if c not in r'\/:*?"<>|').strip()[:20].strip()
-                filename = f"{safe_title}{ext}" if safe_title else os.path.basename(chosen)
-            else:
-                filename = os.path.basename(chosen)
-
-            s3_key = f"downloads/{job_id}/{filename}"
-            with open(chosen, "rb") as f:
-                s3_client.put_object(
-                    Bucket=S3_BUCKET_NAME,
-                    Key=s3_key,
-                    Body=f
+                update_job(
+                    job_id,
+                    status="error",
+                    error=extract_error(result.stderr),
+                    finished_at=time.time(),
                 )
+                return
 
-            s3_url = f"{R2_CUSTOM_DOMAIN}/{s3_key}"
-            job["status"] = "done"
-            job["s3_url"] = s3_url
-            job["filename"] = filename
-            job["upload_time"] = time.time()
+            chosen = find_downloaded_file(temp_dir, job_id, format_choice)
+            fallback_name = os.path.basename(chosen)
+            job = get_job(job_id) or {}
+            filename = sanitize_filename(job.get("title"), fallback_name)
+            s3_key = f"downloads/{job_id}/{filename}"
 
+            update_job(job_id, status="uploading")
+            upload_file_to_s3(chosen, s3_key)
+
+            update_job(
+                job_id,
+                status="done",
+                s3_key=s3_key,
+                s3_url=build_s3_url(s3_key),
+                filename=filename,
+                upload_time=time.time(),
+                finished_at=time.time(),
+                error=None,
+            )
         except subprocess.TimeoutExpired:
-            job["status"] = "error"
-            job["error"] = "Download timed out (5 min limit)"
-        except Exception as e:
-            job["status"] = "error"
-            job["error"] = str(e)
+            update_job(
+                job_id,
+                status="error",
+                error=f"Download timed out ({DOWNLOAD_TIMEOUT // 60} min limit)",
+                finished_at=time.time(),
+            )
+        except FileNotFoundError as exc:
+            update_job(job_id, status="error", error=str(exc), finished_at=time.time())
+        except Exception as exc:
+            update_job(job_id, status="error", error=str(exc), finished_at=time.time())
+
+
+def download_worker():
+    while True:
+        job_id, url, format_choice, format_id = download_queue.get()
+        try:
+            run_download(job_id, url, format_choice, format_id)
+        finally:
+            download_queue.task_done()
+
+
+def start_background_workers():
+    cleanup_thread = threading.Thread(target=cleanup_old_files, daemon=True)
+    cleanup_thread.start()
+
+    for worker_index in range(DOWNLOAD_WORKERS):
+        worker = threading.Thread(target=download_worker, name=f"download-worker-{worker_index}", daemon=True)
+        worker.start()
+
+
+start_background_workers()
 
 
 @app.route("/")
@@ -129,58 +280,70 @@ def index():
 
 @app.route("/api/info", methods=["POST"])
 def get_info():
-    data = request.json
+    data = get_json_payload()
     url = data.get("url", "").strip()
     if not url:
         return jsonify({"error": "No URL provided"}), 400
 
-    cmd = ["yt-dlp", "--no-playlist", *COOKIES_CMD, "-j", url]
+    cached = get_cached_info(url)
+    if cached is not None:
+        return jsonify(cached)
+
+    if not info_semaphore.acquire(blocking=False):
+        return jsonify({"error": "Server is busy fetching video info. Please retry in a moment."}), 429
+
+    cmd = ["yt-dlp", "--no-playlist", "--no-warnings", *COOKIES_CMD, "-J", url]
 
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=INFO_TIMEOUT)
         if result.returncode != 0:
-            return jsonify({"error": result.stderr.strip().split("\n")[-1]}), 400
+            return jsonify({"error": extract_error(result.stderr)}), 400
 
         info = json.loads(result.stdout)
 
         best_by_height = {}
-        for f in info.get("formats", []):
-            height = f.get("height")
-            vcodec = f.get("vcodec", "none")
-            proto = f.get("protocol", "")
+        for fmt in info.get("formats", []):
+            height = fmt.get("height")
+            vcodec = fmt.get("vcodec", "none")
+            proto = fmt.get("protocol", "")
             if not height or vcodec == "none":
                 continue
             if proto not in ("https", "http"):
                 continue
-            tbr = f.get("tbr") or 0
+            tbr = fmt.get("tbr") or 0
             if height not in best_by_height or tbr > (best_by_height[height].get("tbr") or 0):
-                best_by_height[height] = f
+                best_by_height[height] = fmt
 
-        formats = []
-        for height, f in best_by_height.items():
-            formats.append({
-                "id": f["format_id"],
+        formats = [
+            {
+                "id": fmt["format_id"],
                 "label": f"{height}p",
                 "height": height,
-            })
-        formats.sort(key=lambda x: x["height"], reverse=True)
+            }
+            for height, fmt in best_by_height.items()
+        ]
+        formats.sort(key=lambda item: item["height"], reverse=True)
 
-        return jsonify({
+        payload = {
             "title": info.get("title", ""),
             "thumbnail": info.get("thumbnail", ""),
             "duration": info.get("duration"),
             "uploader": info.get("uploader", ""),
             "formats": formats,
-        })
+        }
+        cache_info(url, payload)
+        return jsonify(payload)
     except subprocess.TimeoutExpired:
         return jsonify({"error": "Timed out fetching video info"}), 400
-    except Exception as e:
-        return jsonify({"error": str(e)}), 400
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 400
+    finally:
+        info_semaphore.release()
 
 
 @app.route("/api/download", methods=["POST"])
 def start_download():
-    data = request.json
+    data = get_json_payload()
     url = data.get("url", "").strip()
     format_choice = data.get("format", "video")
     format_id = data.get("format_id")
@@ -190,30 +353,44 @@ def start_download():
         return jsonify({"error": "No URL provided"}), 400
 
     job_id = uuid.uuid4().hex[:10]
-    jobs[job_id] = {"status": "downloading", "url": url, "title": title}
+    create_job(
+        job_id,
+        status="queued",
+        url=url,
+        title=title,
+        format_choice=format_choice,
+        format_id=format_id,
+        created_at=time.time(),
+        error=None,
+    )
 
-    thread = threading.Thread(target=run_download, args=(job_id, url, format_choice, format_id))
-    thread.daemon = True
-    thread.start()
+    try:
+        download_queue.put_nowait((job_id, url, format_choice, format_id))
+    except queue.Full:
+        delete_job(job_id)
+        return jsonify({"error": "Download queue is full. Please retry in a moment."}), 429
 
-    return jsonify({"job_id": job_id})
+    return jsonify({"job_id": job_id, "status": "queued"})
 
 
 @app.route("/api/status/<job_id>")
 def check_status(job_id):
-    job = jobs.get(job_id)
+    job = get_job(job_id)
     if not job:
         return jsonify({"error": "Job not found"}), 404
-    return jsonify({
-        "status": job["status"],
-        "error": job.get("error"),
-        "filename": job.get("filename"),
-    })
+
+    return jsonify(
+        {
+            "status": job["status"],
+            "error": job.get("error"),
+            "filename": job.get("filename"),
+        }
+    )
 
 
 @app.route("/api/file/<job_id>")
 def download_file(job_id):
-    job = jobs.get(job_id)
+    job = get_job(job_id)
     if not job or job["status"] != "done":
         return jsonify({"error": "File not ready"}), 404
     return redirect(job["s3_url"])

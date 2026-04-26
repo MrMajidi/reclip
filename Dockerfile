@@ -11,4 +11,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 EXPOSE 8899
 ENV HOST=0.0.0.0
-CMD ["python", "app.py"]
+CMD ["gunicorn", "--bind", "0.0.0.0:8899", "--workers", "1", "--threads", "16", "--timeout", "300", "app:app"]
