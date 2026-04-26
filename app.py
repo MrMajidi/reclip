@@ -125,11 +125,38 @@ def get_cached_info(url):
         return cached["payload"]
 
 
+def delete_s3_objects(keys):
+    if not keys or not S3_BUCKET_NAME:
+        return
+
+    for start in range(0, len(keys), 1000):
+        batch = keys[start:start + 1000]
+        s3_client.delete_objects(
+            Bucket=S3_BUCKET_NAME,
+            Delete={"Objects": [{"Key": key} for key in batch], "Quiet": True},
+        )
+
+
+def cleanup_expired_bucket_objects(current_time):
+    if not S3_BUCKET_NAME:
+        return
+
+    expired_keys = []
+    paginator = s3_client.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=S3_BUCKET_NAME, Prefix="downloads/"):
+        for obj in page.get("Contents", []):
+            if current_time - obj["LastModified"].timestamp() > FILE_RETENTION_TIME:
+                expired_keys.append(obj["Key"])
+
+    delete_s3_objects(expired_keys)
+
+
 def cleanup_old_files():
     while True:
         try:
             time.sleep(CLEANUP_INTERVAL)
             current_time = time.time()
+            cleanup_expired_bucket_objects(current_time)
 
             with info_cache_lock:
                 expired_urls = [url for url, cached in info_cache.items() if cached["expires_at"] <= current_time]
@@ -143,13 +170,6 @@ def cleanup_old_files():
                 finished_at = job.get("finished_at")
                 if not finished_at or current_time - finished_at <= FILE_RETENTION_TIME:
                     continue
-
-                if job.get("status") == "done" and job.get("s3_key"):
-                    try:
-                        s3_client.delete_object(Bucket=S3_BUCKET_NAME, Key=job["s3_key"])
-                    except Exception as exc:
-                        print(f"Error deleting {job['s3_key']}: {exc}")
-                        continue
 
                 delete_job(job_id)
         except Exception as exc:
