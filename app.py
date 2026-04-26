@@ -8,6 +8,7 @@ import tempfile
 import threading
 import time
 import uuid
+from urllib.parse import urlparse
 
 import boto3
 from boto3.s3.transfer import TransferConfig
@@ -29,6 +30,19 @@ DOWNLOAD_WORKERS = max(1, int(os.environ.get("DOWNLOAD_WORKERS", "4")))
 MAX_DOWNLOAD_QUEUE_SIZE = max(1, int(os.environ.get("MAX_DOWNLOAD_QUEUE_SIZE", "32")))
 MAX_CONCURRENT_INFO_REQUESTS = max(1, int(os.environ.get("MAX_CONCURRENT_INFO_REQUESTS", "8")))
 S3_MULTIPART_CHUNK_SIZE_MB = max(5, int(os.environ.get("S3_MULTIPART_CHUNK_SIZE_MB", "8")))
+YTDLP_COOKIES_MODE = os.environ.get("YTDLP_COOKIES_MODE", "auto").strip().lower()
+YTDLP_BROWSER_NAME = os.environ.get("YTDLP_BROWSER_NAME", "chromium").strip()
+YTDLP_COOKIES_DIR = os.environ.get("YTDLP_COOKIES_DIR", os.path.join(os.path.dirname(__file__), "cookies"))
+YTDLP_EXTRACTOR_RETRIES = max(1, int(os.environ.get("YTDLP_EXTRACTOR_RETRIES", "3")))
+YTDLP_RETRY_SLEEP = os.environ.get("YTDLP_RETRY_SLEEP", "extractor:exp=5:60").strip()
+YOUTUBE_REQUEST_SPACING_SECONDS = max(0.0, float(os.environ.get("YOUTUBE_REQUEST_SPACING_SECONDS", "6")))
+YOUTUBE_SLEEP_REQUESTS_SECONDS = max(0.0, float(os.environ.get("YOUTUBE_SLEEP_REQUESTS_SECONDS", "1.0")))
+YOUTUBE_SLEEP_INTERVAL_SECONDS = max(0.0, float(os.environ.get("YOUTUBE_SLEEP_INTERVAL_SECONDS", "5.0")))
+YOUTUBE_MAX_SLEEP_INTERVAL_SECONDS = max(
+    YOUTUBE_SLEEP_INTERVAL_SECONDS,
+    float(os.environ.get("YOUTUBE_MAX_SLEEP_INTERVAL_SECONDS", "8.0")),
+)
+YOUTUBE_RATE_LIMIT_COOLDOWN_SECONDS = max(60, int(os.environ.get("YOUTUBE_RATE_LIMIT_COOLDOWN_SECONDS", "3600")))
 
 s3_client = boto3.client(
     "s3",
@@ -42,7 +56,6 @@ s3_transfer_config = TransferConfig(
 )
 
 COOKIES_FILE = os.path.join(os.path.dirname(__file__), "cookies.txt")
-COOKIES_CMD = ["--cookies", COOKIES_FILE] if os.path.exists(COOKIES_FILE) else ["--cookies-from-browser", "chromium"]
 
 jobs = {}
 jobs_lock = threading.Lock()
@@ -50,10 +63,117 @@ download_queue = queue.Queue(maxsize=MAX_DOWNLOAD_QUEUE_SIZE)
 info_cache = {}
 info_cache_lock = threading.Lock()
 info_semaphore = threading.BoundedSemaphore(MAX_CONCURRENT_INFO_REQUESTS)
+youtube_rate_limit_lock = threading.Lock()
+cookie_rotation_lock = threading.Lock()
+cookie_file_cooldowns = {}
+cookie_rotation_index = 0
+youtube_last_request_started_at = 0.0
+youtube_cooldown_until = 0.0
+
+
+class YoutubeRateLimitError(Exception):
+    pass
 
 
 def get_json_payload():
     return request.get_json(silent=True) or {}
+
+
+def is_youtube_url(url):
+    hostname = (urlparse(url).hostname or "").lower()
+    return hostname.endswith("youtube.com") or hostname.endswith("youtu.be") or hostname.endswith("youtube-nocookie.com")
+
+
+def list_rotation_cookie_files():
+    if not os.path.isdir(YTDLP_COOKIES_DIR):
+        return []
+
+    cookie_files = []
+    for name in sorted(os.listdir(YTDLP_COOKIES_DIR)):
+        if name.startswith("."):
+            continue
+        path = os.path.join(YTDLP_COOKIES_DIR, name)
+        if os.path.isfile(path):
+            cookie_files.append(path)
+    return cookie_files
+
+
+def build_cookie_source(source_type, *, path=None, browser_name=None):
+    source = {"type": source_type, "path": path, "browser_name": browser_name}
+    if source_type == "file" and path:
+        source["args"] = ["--cookies", path]
+    elif source_type == "browser" and browser_name:
+        source["args"] = ["--cookies-from-browser", browser_name]
+    else:
+        source["args"] = []
+    return source
+
+
+def get_rotating_cookie_source(url):
+    global cookie_rotation_index
+
+    cookie_files = list_rotation_cookie_files()
+    if not cookie_files:
+        return None
+
+    youtube_request = is_youtube_url(url)
+    now = time.time()
+
+    with cookie_rotation_lock:
+        active_files = []
+        next_ready_at = None
+
+        for path in cookie_files:
+            ready_at = cookie_file_cooldowns.get(path, 0.0)
+            if not youtube_request or ready_at <= now:
+                active_files.append(path)
+            else:
+                next_ready_at = ready_at if next_ready_at is None else min(next_ready_at, ready_at)
+
+        stale_paths = [path for path in list(cookie_file_cooldowns) if path not in cookie_files]
+        for path in stale_paths:
+            cookie_file_cooldowns.pop(path, None)
+
+        if not active_files:
+            wait_seconds = max(1, int((next_ready_at or now) - now))
+            minutes = max(1, int((wait_seconds + 59) // 60))
+            raise YoutubeRateLimitError(
+                "All rotated YouTube cookies are cooling down right now. "
+                f"Please wait about {minutes} minute(s) or add more cookie files."
+            )
+
+        selected_index = cookie_rotation_index % len(active_files)
+        selected_path = active_files[selected_index]
+        cookie_rotation_index = (cookie_rotation_index + 1) % len(active_files)
+        return build_cookie_source("file", path=selected_path)
+
+
+def resolve_cookie_source(url):
+    mode = YTDLP_COOKIES_MODE
+    if mode == "off":
+        return build_cookie_source("none")
+    if mode == "browser":
+        return build_cookie_source("browser", browser_name=YTDLP_BROWSER_NAME)
+
+    rotating_source = get_rotating_cookie_source(url)
+    if rotating_source:
+        return rotating_source
+
+    if mode == "file":
+        if os.path.exists(COOKIES_FILE):
+            return build_cookie_source("file", path=COOKIES_FILE)
+        return build_cookie_source("none")
+
+    if mode == "auto":
+        if os.path.exists(COOKIES_FILE):
+            return build_cookie_source("file", path=COOKIES_FILE)
+        if is_youtube_url(url):
+            return build_cookie_source("none")
+        return build_cookie_source("browser", browser_name=YTDLP_BROWSER_NAME)
+
+    if os.path.exists(COOKIES_FILE):
+        return build_cookie_source("file", path=COOKIES_FILE)
+    return build_cookie_source("none")
 
 
 def create_job(job_id, **fields):
@@ -85,6 +205,101 @@ def extract_error(stderr):
         if stripped:
             return stripped
     return "Request failed"
+
+
+def is_youtube_rate_limit_message(message):
+    message = (message or "").lower()
+    return (
+        "rate-limited by youtube" in message
+        or "this content isn't available, try again later" in message
+        or "sign in to confirm you’re not a bot" in message
+        or "sign in to confirm you're not a bot" in message
+    )
+
+
+def get_youtube_cooldown_error(now=None):
+    current_time = now or time.time()
+    with youtube_rate_limit_lock:
+        remaining = youtube_cooldown_until - current_time
+    if remaining <= 0:
+        return None
+
+    minutes = max(1, int((remaining + 59) // 60))
+    return (
+        "YouTube is rate-limiting this account/IP right now. "
+        f"Please wait about {minutes} minute(s), reduce request volume, or disable browser cookies for YouTube."
+    )
+
+
+def mark_youtube_rate_limited():
+    global youtube_cooldown_until
+
+    with youtube_rate_limit_lock:
+        youtube_cooldown_until = max(youtube_cooldown_until, time.time() + YOUTUBE_RATE_LIMIT_COOLDOWN_SECONDS)
+
+
+def wait_for_youtube_request_slot(url):
+    global youtube_last_request_started_at
+
+    if not is_youtube_url(url):
+        return
+
+    cooldown_error = get_youtube_cooldown_error()
+    if cooldown_error:
+        raise YoutubeRateLimitError(cooldown_error)
+
+    with youtube_rate_limit_lock:
+        now = time.time()
+        sleep_for = max(0.0, (youtube_last_request_started_at + YOUTUBE_REQUEST_SPACING_SECONDS) - now)
+        if sleep_for > 0:
+            time.sleep(sleep_for)
+        youtube_last_request_started_at = time.time()
+
+
+def mark_cookie_source_rate_limited(cookie_source):
+    if not cookie_source or cookie_source.get("type") != "file" or not cookie_source.get("path"):
+        return
+
+    with cookie_rotation_lock:
+        cookie_file_cooldowns[cookie_source["path"]] = time.time() + YOUTUBE_RATE_LIMIT_COOLDOWN_SECONDS
+
+
+def build_base_yt_dlp_cmd(url, cookie_source):
+    return [
+        "yt-dlp",
+        "--no-playlist",
+        "--no-warnings",
+        "--extractor-retries",
+        str(YTDLP_EXTRACTOR_RETRIES),
+        "--retry-sleep",
+        YTDLP_RETRY_SLEEP,
+        *cookie_source["args"],
+    ]
+
+
+def maybe_apply_youtube_rate_limit(result, url, cookie_source):
+    if not is_youtube_url(url) or result.returncode == 0 or not is_youtube_rate_limit_message(result.stderr):
+        return
+
+    if cookie_source.get("type") == "file":
+        mark_cookie_source_rate_limited(cookie_source)
+
+    if cookie_source.get("type") != "file" or "not a bot" in result.stderr.lower():
+        mark_youtube_rate_limited()
+
+
+def run_yt_dlp_command(cmd, *, url, timeout, cookie_source, capture_stdout=True):
+    wait_for_youtube_request_slot(url)
+
+    result = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE if capture_stdout else subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=timeout,
+    )
+    maybe_apply_youtube_rate_limit(result, url, cookie_source)
+    return result
 
 
 def sanitize_filename(title, fallback_name):
@@ -203,33 +418,41 @@ def run_download(job_id, url, format_choice, format_id):
     update_job(job_id, status="downloading", error=None)
 
     with tempfile.TemporaryDirectory() as temp_dir:
-        out_template = os.path.join(temp_dir, f"{job_id}.%(ext)s")
-        cmd = [
-            "yt-dlp",
-            "--no-playlist",
-            "--no-progress",
-            "--no-warnings",
-            *COOKIES_CMD,
-            "-o",
-            out_template,
-        ]
-
-        if format_choice == "audio":
-            cmd += ["-x", "--audio-format", "mp3"]
-        elif format_id:
-            cmd += ["-f", f"{format_id}+bestaudio/{format_id}/bestvideo+bestaudio/best", "--merge-output-format", "mp4"]
-        else:
-            cmd += ["-f", "bestvideo+bestaudio/best", "--merge-output-format", "mp4"]
-
-        cmd.append(url)
-
         try:
-            result = subprocess.run(
+            cookie_source = resolve_cookie_source(url)
+            out_template = os.path.join(temp_dir, f"{job_id}.%(ext)s")
+            cmd = [
+                *build_base_yt_dlp_cmd(url, cookie_source),
+                "--no-progress",
+                "-o",
+                out_template,
+            ]
+
+            if is_youtube_url(url):
+                cmd += [
+                    "--sleep-requests",
+                    str(YOUTUBE_SLEEP_REQUESTS_SECONDS),
+                    "--sleep-interval",
+                    str(YOUTUBE_SLEEP_INTERVAL_SECONDS),
+                    "--max-sleep-interval",
+                    str(YOUTUBE_MAX_SLEEP_INTERVAL_SECONDS),
+                ]
+
+            if format_choice == "audio":
+                cmd += ["-x", "--audio-format", "mp3"]
+            elif format_id:
+                cmd += ["-f", f"{format_id}+bestaudio/{format_id}/bestvideo+bestaudio/best", "--merge-output-format", "mp4"]
+            else:
+                cmd += ["-f", "bestvideo+bestaudio/best", "--merge-output-format", "mp4"]
+
+            cmd.append(url)
+
+            result = run_yt_dlp_command(
                 cmd,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                text=True,
+                url=url,
                 timeout=DOWNLOAD_TIMEOUT,
+                cookie_source=cookie_source,
+                capture_stdout=False,
             )
             if result.returncode != 0:
                 update_job(
@@ -266,6 +489,8 @@ def run_download(job_id, url, format_choice, format_id):
                 error=f"Download timed out ({DOWNLOAD_TIMEOUT // 60} min limit)",
                 finished_at=time.time(),
             )
+        except YoutubeRateLimitError as exc:
+            update_job(job_id, status="error", error=str(exc), finished_at=time.time())
         except FileNotFoundError as exc:
             update_job(job_id, status="error", error=str(exc), finished_at=time.time())
         except Exception as exc:
@@ -312,12 +537,17 @@ def get_info():
     if not info_semaphore.acquire(blocking=False):
         return jsonify({"error": "Server is busy fetching video info. Please retry in a moment."}), 429
 
-    cmd = ["yt-dlp", "--no-playlist", "--no-warnings", *COOKIES_CMD, "-J", url]
-
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=INFO_TIMEOUT)
+        cookie_source = resolve_cookie_source(url)
+        cmd = [*build_base_yt_dlp_cmd(url, cookie_source), "-J", url]
+        if is_youtube_url(url):
+            cmd += ["--sleep-requests", str(YOUTUBE_SLEEP_REQUESTS_SECONDS)]
+
+        result = run_yt_dlp_command(cmd, url=url, timeout=INFO_TIMEOUT, cookie_source=cookie_source)
         if result.returncode != 0:
-            return jsonify({"error": extract_error(result.stderr)}), 400
+            error_message = extract_error(result.stderr)
+            status_code = 429 if is_youtube_rate_limit_message(error_message) else 400
+            return jsonify({"error": error_message}), status_code
 
         info = json.loads(result.stdout)
 
@@ -353,6 +583,8 @@ def get_info():
         }
         cache_info(url, payload)
         return jsonify(payload)
+    except YoutubeRateLimitError as exc:
+        return jsonify({"error": str(exc)}), 429
     except subprocess.TimeoutExpired:
         return jsonify({"error": "Timed out fetching video info"}), 400
     except Exception as exc:

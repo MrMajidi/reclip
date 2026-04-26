@@ -5,7 +5,7 @@ RUN apt-get update && \
 RUN mkdir -p /root/.config/yt-dlp && \
     echo "--js-runtimes node" > /root/.config/yt-dlp/config
 WORKDIR /app
-COPY cookies.txt /app/cookies.txt
+COPY cookies /app/cookies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
