@@ -78,7 +78,7 @@ def run_download(job_id, url, format_choice, format_id):
                     Body=f
                 )
 
-            s3_url = f"{R2_CUSTOM_DOMAIN}/{S3_BUCKET_NAME}/{s3_key}"
+            s3_url = f"{R2_CUSTOM_DOMAIN}/{s3_key}"
             job["status"] = "done"
             job["s3_url"] = s3_url
             job["filename"] = filename
