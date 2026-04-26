@@ -5,6 +5,7 @@ import uuid
 import subprocess
 import threading
 import tempfile
+import time
 import boto3
 from flask import Flask, request, jsonify, redirect, render_template
 
@@ -24,6 +25,35 @@ COOKIES_DIR = os.path.join(os.path.dirname(__file__), "cookies.txt")
 COOKIES_CMD = ["--cookies-from-browser", "chromium"] if not os.path.exists(COOKIES_DIR) else ["--cookies", COOKIES_DIR]
 
 jobs = {}
+CLEANUP_INTERVAL = 600  # 10 minutes
+FILE_RETENTION_TIME = 3600  # 1 hour
+
+
+def cleanup_old_files():
+    while True:
+        try:
+            time.sleep(CLEANUP_INTERVAL)
+            current_time = time.time()
+            to_delete = []
+
+            for job_id, job in list(jobs.items()):
+                if job["status"] == "done" and "upload_time" in job:
+                    if current_time - job["upload_time"] > FILE_RETENTION_TIME:
+                        s3_key = f"downloads/{job_id}/{job['filename']}"
+                        try:
+                            s3_client.delete_object(Bucket=S3_BUCKET_NAME, Key=s3_key)
+                            to_delete.append(job_id)
+                        except Exception as e:
+                            print(f"Error deleting {s3_key}: {e}")
+
+            for job_id in to_delete:
+                del jobs[job_id]
+        except Exception as e:
+            print(f"Cleanup job error: {e}")
+
+
+cleanup_thread = threading.Thread(target=cleanup_old_files, daemon=True)
+cleanup_thread.start()
 
 
 def run_download(job_id, url, format_choice, format_id):
@@ -82,6 +112,7 @@ def run_download(job_id, url, format_choice, format_id):
             job["status"] = "done"
             job["s3_url"] = s3_url
             job["filename"] = filename
+            job["upload_time"] = time.time()
 
         except subprocess.TimeoutExpired:
             job["status"] = "error"
