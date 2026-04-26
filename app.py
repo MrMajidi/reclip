@@ -1,4 +1,7 @@
+import os
 import json
+import glob
+import uuid
 import subprocess
 import threading
 import tempfile
@@ -89,6 +92,96 @@ def run_download(job_id, url, format_choice, format_id):
 
 
 @app.route("/")
+def index():
+    return render_template("index.html")
+
+
+@app.route("/api/info", methods=["POST"])
+def get_info():
+    data = request.json
+    url = data.get("url", "").strip()
+    if not url:
+        return jsonify({"error": "No URL provided"}), 400
+
+    cmd = ["yt-dlp", "--no-playlist", *COOKIES_CMD, "-j", url]
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        if result.returncode != 0:
+            return jsonify({"error": result.stderr.strip().split("\n")[-1]}), 400
+
+        info = json.loads(result.stdout)
+
+        best_by_height = {}
+        for f in info.get("formats", []):
+            height = f.get("height")
+            vcodec = f.get("vcodec", "none")
+            proto = f.get("protocol", "")
+            if not height or vcodec == "none":
+                continue
+            if proto not in ("https", "http"):
+                continue
+            tbr = f.get("tbr") or 0
+            if height not in best_by_height or tbr > (best_by_height[height].get("tbr") or 0):
+                best_by_height[height] = f
+
+        formats = []
+        for height, f in best_by_height.items():
+            formats.append({
+                "id": f["format_id"],
+                "label": f"{height}p",
+                "height": height,
+            })
+        formats.sort(key=lambda x: x["height"], reverse=True)
+
+        return jsonify({
+            "title": info.get("title", ""),
+            "thumbnail": info.get("thumbnail", ""),
+            "duration": info.get("duration"),
+            "uploader": info.get("uploader", ""),
+            "formats": formats,
+        })
+    except subprocess.TimeoutExpired:
+        return jsonify({"error": "Timed out fetching video info"}), 400
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@app.route("/api/download", methods=["POST"])
+def start_download():
+    data = request.json
+    url = data.get("url", "").strip()
+    format_choice = data.get("format", "video")
+    format_id = data.get("format_id")
+    title = data.get("title", "")
+
+    if not url:
+        return jsonify({"error": "No URL provided"}), 400
+
+    job_id = uuid.uuid4().hex[:10]
+    jobs[job_id] = {"status": "downloading", "url": url, "title": title}
+
+    thread = threading.Thread(target=run_download, args=(job_id, url, format_choice, format_id))
+    thread.daemon = True
+    thread.start()
+
+    return jsonify({"job_id": job_id})
+
+
+@app.route("/api/status/<job_id>")
+def check_status(job_id):
+    job = jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "Job not found"}), 404
+    return jsonify({
+        "status": job["status"],
+        "error": job.get("error"),
+        "filename": job.get("filename"),
+    })
+
+
+@app.route("/api/file/<job_id>")
+def download_file(job_id):
     job = jobs.get(job_id)
     if not job or job["status"] != "done":
         return jsonify({"error": "File not ready"}), 404
@@ -96,3 +189,6 @@ def run_download(job_id, url, format_choice, format_id):
 
 
 if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8899))
+    host = os.environ.get("HOST", "127.0.0.1")
+    app.run(host=host, port=port)
