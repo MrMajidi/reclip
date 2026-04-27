@@ -5,6 +5,7 @@ import os
 import queue
 import random
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -106,7 +107,9 @@ def list_rotation_cookie_files():
 def fetch_proxy_list():
     global proxy_list
     if not PROXY_LIST_URL:
+        print("[proxy] PROXY_LIST_URL is not set, proxy rotation disabled", file=sys.stderr)
         return
+    print(f"[proxy] Fetching proxy list from {PROXY_LIST_URL[:60]}...", file=sys.stderr)
     try:
         with urlopen(PROXY_LIST_URL, timeout=15) as resp:
             text = resp.read().decode("utf-8")
@@ -121,9 +124,9 @@ def fetch_proxy_list():
                 parsed.append(f"http://{user}:{pwd}@{host}:{port}")
         with proxy_list_lock:
             proxy_list = parsed
-        print(f"[proxy] Loaded {len(parsed)} proxies")
+        print(f"[proxy] Loaded {len(parsed)} proxies", file=sys.stderr)
     except Exception as e:
-        print(f"[proxy] Failed to fetch proxy list: {e}")
+        print(f"[proxy] Failed to fetch proxy list: {e}", file=sys.stderr)
 
 
 def get_random_proxy():
