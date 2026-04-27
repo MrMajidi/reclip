@@ -70,7 +70,6 @@ info_semaphore = threading.BoundedSemaphore(MAX_CONCURRENT_INFO_REQUESTS)
 youtube_rate_limit_lock = threading.Lock()
 cookie_rotation_lock = threading.Lock()
 cookie_file_cooldowns = {}
-cookie_rotation_index = 0
 proxy_list = []
 proxy_list_lock = threading.Lock()
 youtube_last_request_started_at = 0.0
@@ -148,8 +147,6 @@ def build_cookie_source(source_type, *, path=None, browser_name=None):
 
 
 def get_rotating_cookie_source(url):
-    global cookie_rotation_index
-
     cookie_files = list_rotation_cookie_files()
     if not cookie_files:
         return None
@@ -180,10 +177,9 @@ def get_rotating_cookie_source(url):
                 f"Please wait about {minutes} minute(s) or add more cookie files."
             )
 
-        selected_index = cookie_rotation_index % len(active_files)
-        selected_path = active_files[selected_index]
-        cookie_rotation_index = (cookie_rotation_index + 1) % len(active_files)
-        return build_cookie_source("file", path=selected_path)
+        selected = random.choice(active_files)
+        print(f"[cookie] Selected {os.path.basename(selected)} ({len(active_files)} active)", file=sys.stderr)
+        return build_cookie_source("file", path=selected)
 
 
 def resolve_cookie_source(url):
