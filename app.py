@@ -3,12 +3,14 @@ import json
 import mimetypes
 import os
 import queue
+import random
 import subprocess
 import tempfile
 import threading
 import time
 import uuid
 from urllib.parse import urlparse
+from urllib.request import urlopen
 
 import boto3
 from boto3.s3.transfer import TransferConfig
@@ -33,6 +35,7 @@ S3_MULTIPART_CHUNK_SIZE_MB = max(5, int(os.environ.get("S3_MULTIPART_CHUNK_SIZE_
 YTDLP_COOKIES_MODE = os.environ.get("YTDLP_COOKIES_MODE", "auto").strip().lower()
 YTDLP_BROWSER_NAME = os.environ.get("YTDLP_BROWSER_NAME", "chromium").strip()
 YTDLP_COOKIES_DIR = os.environ.get("YTDLP_COOKIES_DIR", os.path.join(os.path.dirname(__file__), "cookies"))
+PROXY_LIST_URL = os.environ.get("PROXY_LIST_URL", "https://proxy.webshare.io/api/v2/proxy/list/download/lwclhnsrgfkyxvbiqptqmhjbkqihgvmwgyhkwlai/-/any/username/direct/-/?plan_id=13259069").strip()
 YTDLP_EXTRACTOR_RETRIES = max(1, int(os.environ.get("YTDLP_EXTRACTOR_RETRIES", "3")))
 YTDLP_RETRY_SLEEP = os.environ.get("YTDLP_RETRY_SLEEP", "extractor:exp=5:60").strip()
 YOUTUBE_REQUEST_SPACING_SECONDS = max(0.0, float(os.environ.get("YOUTUBE_REQUEST_SPACING_SECONDS", "6")))
@@ -67,6 +70,8 @@ youtube_rate_limit_lock = threading.Lock()
 cookie_rotation_lock = threading.Lock()
 cookie_file_cooldowns = {}
 cookie_rotation_index = 0
+proxy_list = []
+proxy_list_lock = threading.Lock()
 youtube_last_request_started_at = 0.0
 youtube_cooldown_until = 0.0
 
@@ -96,6 +101,36 @@ def list_rotation_cookie_files():
         if os.path.isfile(path):
             cookie_files.append(path)
     return cookie_files
+
+
+def fetch_proxy_list():
+    global proxy_list
+    if not PROXY_LIST_URL:
+        return
+    try:
+        with urlopen(PROXY_LIST_URL, timeout=15) as resp:
+            text = resp.read().decode("utf-8")
+        parsed = []
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split(":")
+            if len(parts) == 4:
+                host, port, user, pwd = parts
+                parsed.append(f"http://{user}:{pwd}@{host}:{port}")
+        with proxy_list_lock:
+            proxy_list = parsed
+        print(f"[proxy] Loaded {len(parsed)} proxies")
+    except Exception as e:
+        print(f"[proxy] Failed to fetch proxy list: {e}")
+
+
+def get_random_proxy():
+    with proxy_list_lock:
+        if not proxy_list:
+            return None
+        return random.choice(proxy_list)
 
 
 def build_cookie_source(source_type, *, path=None, browser_name=None):
@@ -265,7 +300,8 @@ def mark_cookie_source_rate_limited(cookie_source):
 
 
 def build_base_yt_dlp_cmd(url, cookie_source):
-    return [
+    proxy = get_random_proxy()
+    cmd = [
         "yt-dlp",
         "--no-playlist",
         "--no-warnings",
@@ -275,6 +311,9 @@ def build_base_yt_dlp_cmd(url, cookie_source):
         YTDLP_RETRY_SLEEP,
         *cookie_source["args"],
     ]
+    if proxy:
+        cmd += ["--proxy", proxy]
+    return cmd
 
 
 def maybe_apply_youtube_rate_limit(result, url, cookie_source):
@@ -515,6 +554,7 @@ def start_background_workers():
         worker.start()
 
 
+fetch_proxy_list()
 start_background_workers()
 
 
