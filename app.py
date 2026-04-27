@@ -312,6 +312,8 @@ def build_base_yt_dlp_cmd(url, cookie_source):
     ]
     if proxy:
         cmd += ["--proxy", proxy]
+    masked_cmd = [f"http://***:***@{proxy.split('@')[1]}" if i > 0 and cmd[i - 1] == "--proxy" else part for i, part in enumerate(cmd)]
+    print(f"[yt-dlp] cmd: {' '.join(masked_cmd)}", file=sys.stderr)
     return cmd
 
 
